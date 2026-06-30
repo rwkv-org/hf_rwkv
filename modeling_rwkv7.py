@@ -1,46 +1,34 @@
 from __future__ import annotations
 
-import warnings
-from typing import TYPE_CHECKING
-
-import torch
-import torch.nn as nn
-from einops import rearrange
-from torch.nn import functional as F
-
-from fla.layers.rwkv6 import LoRA
-from fla.layers.utils import get_layer_cache, update_layer_cache
-from fla.modules import GroupNorm
-from fla.modules.l2norm import l2_norm
-from fla.modules.token_shift import token_shift
-from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7
-from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7
-from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
-from fla.ops.rwkv7.gate_output_correction import gate_output_correction
-
-if TYPE_CHECKING:
-    from fla.models.utils import Cache
-from __future__ import annotations
-
 import math
 import warnings
 from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
+from einops import rearrange
+from torch.nn import functional as F
+
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from transformers.utils.deprecation import deprecate_kwarg
 
+from .configuration_rwkv7 import RWKV7Config
+
 from fla.layers.attn import Attention
-from fla.layers.rwkv7 import RWKV7Attention
-from fla.models.rwkv7.configuration_rwkv7 import RWKV7Config
+from fla.layers.rwkv6 import LoRA
+from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.models.utils import Cache, FLAGenerationMixin
-from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, LayerNorm
+from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, GroupNorm, LayerNorm
 from fla.modules.activations import ACT2FN
+from fla.modules.l2norm import l2_norm
 from fla.modules.l2warp import l2_warp
 from fla.modules.token_shift import token_shift
+from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7
+from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7
+from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
+from fla.ops.rwkv7.gate_output_correction import gate_output_correction
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -241,7 +229,7 @@ class RWKV7Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        cache_states: Cache | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         output_attentions: bool | None = False,
         v_first: torch.Tensor = None,
@@ -257,7 +245,7 @@ class RWKV7Attention(nn.Module):
             )
             am = attention_mask.narrow(1, attention_mask.size(1) - seq_len, seq_len).unsqueeze(-1)
 
-        last_state = get_layer_cache(self, cache_states)
+        last_state = get_layer_cache(self, past_key_values)
 
         if attention_mask is not None:
             hidden_states = hidden_states.mul(am)
@@ -353,7 +341,7 @@ class RWKV7Attention(nn.Module):
 
         update_layer_cache(
             self,
-            cache_states,
+            past_key_values,
             recurrent_state=recurrent_state,
             conv_state=conv_state,
             offset=r.shape[1],
@@ -367,7 +355,7 @@ class RWKV7Attention(nn.Module):
         o = gate_output_correction(o, r, k, self.r_k, v, g)
         o = self.o_proj(o)
 
-        return o, None, cache_states, v_first
+        return o, None, past_key_values, v_first
     
 class RWKV7FeedForward(nn.Module):
 
@@ -513,7 +501,7 @@ class RWKV7Block(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        cache_states: Cache | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         output_attentions: bool | None = False,
         v_first: torch.Tensor = None,
@@ -522,10 +510,10 @@ class RWKV7Block(GradientCheckpointingLayer):
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         residual = self.pre_norm(hidden_states) if hasattr(self, 'pre_norm') else hidden_states
         hidden_states = self.attn_norm(residual)
-        hidden_states, attentions, cache_states, v_first = self.attn(
+        hidden_states, attentions, past_key_values, v_first = self.attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            cache_states=cache_states,
+            past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             v_first=v_first,
@@ -538,12 +526,12 @@ class RWKV7Block(GradientCheckpointingLayer):
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.ffn_norm(hidden_states)
-        hidden_states, cache_states = self.ffn(
-            hidden_states, attention_mask, cache_states, cu_seqlens, **kwargs,
+        hidden_states, past_key_values = self.ffn(
+            hidden_states, attention_mask, past_key_values, cu_seqlens, **kwargs,
         )
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, attentions, cache_states, v_first)
+        outputs = (hidden_states, attentions, past_key_values, v_first)
 
         return outputs
 
@@ -555,7 +543,7 @@ class RWKV7PreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ['RWKV7Block']
     _supports_cache_class = True
-    _skip_keys_device_placement = ["cache_states"]
+    _skip_keys_device_placement = ["past_key_values"]
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
@@ -695,7 +683,7 @@ class RWKV7Model(RWKV7PreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: Optional[torch.Tensor] = None,  # noqa
         inputs_embeds: torch.FloatTensor | None = None,
-        cache_states: Cache | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -721,8 +709,8 @@ class RWKV7Model(RWKV7PreTrainedModel):
             inputs_embeds = self.embeddings(input_ids)
         hidden_states = inputs_embeds
 
-        if use_cache and not isinstance(cache_states, Cache):
-            cache_states = Cache.from_legacy_cache(cache_states)
+        if use_cache and not isinstance(past_key_values, Cache):
+            past_key_values = Cache.from_legacy_cache(past_key_values)
 
         all_hidden_states = () if output_hidden_states else None
         all_attns = () if output_attentions else None
@@ -732,10 +720,10 @@ class RWKV7Model(RWKV7PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            hidden_states, attentions, cache_states, v_first = layer(
+            hidden_states, attentions, past_key_values, v_first = layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                cache_states=cache_states,
+                past_key_values=past_key_values,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 v_first=v_first,
@@ -753,10 +741,10 @@ class RWKV7Model(RWKV7PreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         if not return_dict:
-            return tuple(i for i in [hidden_states, cache_states, all_hidden_states, all_attns] if i is not None)
+            return tuple(i for i in [hidden_states, past_key_values, all_hidden_states, all_attns] if i is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            cache_states=cache_states,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attns,
         )
@@ -798,9 +786,9 @@ class RWKV7ForCausalLM(RWKV7PreTrainedModel, FLAGenerationMixin):
         try:
             return super().generate(*args, **kwargs)
         except AttributeError as exception:
-            if 'cache_states' in str(exception):
+            if 'past_key_values' in str(exception):
                 raise AttributeError(
-                    f"You tried to call `generate` with a decoding strategy that manipulates `cache_states`, "
+                    f"You tried to call `generate` with a decoding strategy that manipulates `past_key_values`, "
                     f"which is not supported for {self.__class__.__name__}. "
                     f"Try another generation strategy instead. "
                     f"For the available generation strategies, check this doc: "
@@ -815,7 +803,7 @@ class RWKV7ForCausalLM(RWKV7PreTrainedModel, FLAGenerationMixin):
         input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        cache_states: Cache | None = None,
+        past_key_values: Cache | None = None,
         labels: torch.LongTensor | None = None,
         shift_labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
@@ -835,7 +823,7 @@ class RWKV7ForCausalLM(RWKV7PreTrainedModel, FLAGenerationMixin):
             input_ids=input_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            cache_states=cache_states,
+            past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -878,7 +866,7 @@ class RWKV7ForCausalLM(RWKV7PreTrainedModel, FLAGenerationMixin):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            cache_states=outputs.cache_states,
+            past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
