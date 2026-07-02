@@ -16,17 +16,28 @@ from safetensors.torch import save_file
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent
-DEFAULT_VOCAB_SOURCE = DEFAULT_ROOT / "rwkv_vocab_v20260603.txt"
-DEFAULT_CHAT_TEMPLATE_SOURCE = DEFAULT_ROOT / "chat_template.jinja"
-DEFAULT_TOKENIZER_SOURCE = DEFAULT_ROOT / "assets" / "hf_rwkv_tokenizer.py"
+DEFAULT_HF_SOURCE = DEFAULT_ROOT / "hf"
+DEFAULT_VOCAB_SOURCE = DEFAULT_HF_SOURCE / "rwkv_vocab_v20260603.txt"
+DEFAULT_CHAT_TEMPLATE_SOURCE = DEFAULT_HF_SOURCE / "chat_template.jinja"
+DEFAULT_TOKENIZER_SOURCE = DEFAULT_HF_SOURCE / "hf_rwkv_tokenizer.py"
+DEFAULT_MODELING_SOURCE = DEFAULT_HF_SOURCE / "modeling_rwkv7.py"
+DEFAULT_CONFIG_SOURCE = DEFAULT_HF_SOURCE / "configuration_rwkv7.py"
 CANONICAL_VOCAB_NAME = "rwkv_vocab_v20260603.txt"
 MODEL_INDEX_NAME = "model.safetensors.index.json"
 BLOCK_RE = re.compile(r"blocks\.(\d+)\.(.+)")
 CTX_RE = re.compile(r"ctx(\d+)")
-DEFAULT_MAX_POSITION_EMBEDDINGS = 86016
+DEFAULT_MAX_POSITION_EMBEDDINGS = 8192
+
+SIMPLE_CHAT_TEMPLATE = (
+    "{%- for message in messages -%}"
+    "{%- if message.role == 'user' %}User✿{{ message.content }}✿\n"
+    "{%- elif message.role == 'assistant' %}Bot✿{{ message.content }}✿\n"
+    "{%- endif -%}"
+    "{%- endfor -%}Bot✿"
+)
 
 TOP_LEVEL_NAME_MAP = {
-    "emb.weight": "model.embed_tokens.weight",
+    "emb.weight": "model.embeddings.weight",
     "ln_out.weight": "model.norm.weight",
     "ln_out.bias": "model.norm.bias",
     "head.weight": "lm_head.weight",
@@ -72,6 +83,7 @@ LORA_SPECS = {
 }
 
 SPECIAL_TOKEN_FALLBACKS = (
+    "✿",
     "<|endoftext|>",
     "<|rwkv_tokenizer_end_of_text|>",
     "<s>",
@@ -259,7 +271,7 @@ def resolve_primary_special_token(token_ids: dict[str, int]) -> str:
 
 def build_tokenizer_files(
     vocab_path: Path,
-    chat_template_path: Path,
+    chat_template: str,
 ) -> tuple[dict[str, int], dict[str, Any], dict[str, Any], dict[str, int]]:
     token_ids = read_vocab_token_ids(vocab_path)
     primary_special_token = resolve_primary_special_token(token_ids)
@@ -270,7 +282,6 @@ def build_tokenizer_files(
         token: token_ids[token]
         for token in (primary_special_token, *available_extra_tokens)
     }
-    chat_template = chat_template_path.read_text(encoding="utf-8")
 
     tokenizer_config = {
         "add_prefix_space": False,
@@ -343,9 +354,17 @@ def build_model_config(
             v_lora_rank = int(state_dict[key].shape[1])
             break
 
+    max_pos = infer_max_position_embeddings(source, max_position_embeddings)
+
     return {
         "model_type": "rwkv7",
         "architectures": ["RWKV7ForCausalLM"],
+        "auto_map": {
+            "AutoConfig": "configuration_rwkv7.RWKV7Config",
+            "AutoModel": "modeling_rwkv7.RWKV7Model",
+            "AutoModelForCausalLM": "modeling_rwkv7.RWKV7ForCausalLM",
+        },
+        "attn": None,
         "attn_mode": "chunk",
         "hidden_size": hidden_size,
         "hidden_ratio": hidden_ratio,
@@ -362,16 +381,17 @@ def build_model_config(
         "a_low_rank_dim": int(state_dict["blocks.0.att.a1"].shape[1]),
         "v_low_rank_dim": v_lora_rank,
         "hidden_act": "sqrelu",
-        "max_position_embeddings": infer_max_position_embeddings(
-            source, max_position_embeddings
-        ),
+        "max_position_embeddings": max_pos,
         "norm_first": True,
         "norm_bias": "ln_out.bias" in state_dict,
         "norm_eps": 1e-5,
         "tie_word_embeddings": False,
         "use_cache": True,
-        "initializer_range": 0.02,
+        "initializer_range": 0.006,
         "fuse_norm": False,
+        "fuse_cross_entropy": True,
+        "fuse_linear_cross_entropy": False,
+        "use_l2warp": True,
         "vocab_size": int(state_dict["emb.weight"].shape[0]),
         "torch_dtype": torch_dtype_to_hf_string(state_dict["emb.weight"].dtype),
         **special_token_ids,
@@ -453,17 +473,25 @@ def convert_checkpoint(
     vocab_path: Path = DEFAULT_VOCAB_SOURCE,
     chat_template_path: Path = DEFAULT_CHAT_TEMPLATE_SOURCE,
     tokenizer_source: Path = DEFAULT_TOKENIZER_SOURCE,
+    modeling_source: Path = DEFAULT_MODELING_SOURCE,
+    config_source: Path = DEFAULT_CONFIG_SOURCE,
     max_shard_size: str = "5GB",
     max_position_embeddings: int | None = None,
     overwrite: bool = False,
+    use_simple_chat_template: bool = True,
 ) -> ConversionSummary:
     source = source.resolve()
     output_dir = output_dir.resolve()
     prepare_output_dir(output_dir, overwrite)
 
+    if use_simple_chat_template:
+        chat_template = SIMPLE_CHAT_TEMPLATE
+    else:
+        chat_template = chat_template_path.read_text(encoding="utf-8")
+
     state_dict = load_native_rwkv7_state_dict(source)
     token_ids, tokenizer_config, special_tokens_map, explicit_special_ids = (
-        build_tokenizer_files(vocab_path, chat_template_path)
+        build_tokenizer_files(vocab_path, chat_template)
     )
     model_config = build_model_config(
         state_dict,
@@ -478,10 +506,14 @@ def convert_checkpoint(
     converted_state_dict = map_native_state_dict(state_dict)
     num_shards = write_weight_files(converted_state_dict, output_dir, max_shard_size)
 
+    # Copy tokenizer / modeling / config files needed for trust_remote_code
     shutil.copyfile(vocab_path, output_dir / CANONICAL_VOCAB_NAME)
-    shutil.copyfile(chat_template_path, output_dir / "chat_template.jinja")
+    (output_dir / "chat_template.jinja").write_text(chat_template, encoding="utf-8")
     shutil.copyfile(tokenizer_source, output_dir / "hf_rwkv_tokenizer.py")
+    shutil.copyfile(modeling_source, output_dir / "modeling_rwkv7.py")
+    shutil.copyfile(config_source, output_dir / "configuration_rwkv7.py")
     (output_dir / "__init__.py").write_text("", encoding="utf-8")
+
     write_json(output_dir / "config.json", model_config)
     write_json(output_dir / "generation_config.json", generation_config)
     write_json(output_dir / "tokenizer_config.json", tokenizer_config)
@@ -499,19 +531,14 @@ def convert_checkpoint(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert native RWKV7 .pth checkpoints into vLLM-compatible HF directories."
+        description="Convert native RWKV7 .pth checkpoints into transformers-compatible HF directories."
     )
     parser.add_argument("--source", required=True, help="Path to native RWKV7 .pth or .pt checkpoint.")
     parser.add_argument("--output-dir", required=True, help="Output HF directory.")
     parser.add_argument(
-        "--vocab-file",
-        default=str(DEFAULT_VOCAB_SOURCE),
-        help="Vocabulary txt to copy into the output directory.",
-    )
-    parser.add_argument(
-        "--chat-template",
-        default=str(DEFAULT_CHAT_TEMPLATE_SOURCE),
-        help="Jinja chat template to embed into tokenizer_config.json.",
+        "--hf-source",
+        default=str(DEFAULT_HF_SOURCE),
+        help="Directory containing hf_rwkv_tokenizer.py, modeling_rwkv7.py, configuration_rwkv7.py, vocab and chat template.",
     )
     parser.add_argument(
         "--max-shard-size",
@@ -535,11 +562,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    hf_source = Path(args.hf_source)
     summary = convert_checkpoint(
         Path(args.source),
         Path(args.output_dir),
-        vocab_path=Path(args.vocab_file),
-        chat_template_path=Path(args.chat_template),
+        vocab_path=hf_source / "rwkv_vocab_v20260603.txt",
+        chat_template_path=hf_source / "chat_template.jinja",
+        tokenizer_source=hf_source / "hf_rwkv_tokenizer.py",
+        modeling_source=hf_source / "modeling_rwkv7.py",
+        config_source=hf_source / "configuration_rwkv7.py",
         max_shard_size=args.max_shard_size,
         max_position_embeddings=args.max_position_embeddings,
         overwrite=args.overwrite,
