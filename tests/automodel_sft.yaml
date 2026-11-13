@@ -1,0 +1,100 @@
+# Minimal NeMo AutoModel SFT smoke recipe for a converted RWKV7 HF directory.
+#
+# Replace the model/tokenizer paths, then run from the Automodel checkout:
+#
+#   # FLA kernels (optional, faster):
+#   PYTHONPATH=/path/to/fla-MA .venv/bin/automodel <this-file> --nproc-per-node 1
+#
+#   # no FLA at all (pure PyTorch kernels):
+#   RWKV7_KERNEL_BACKEND=torch .venv/bin/automodel <this-file> --nproc-per-node 1
+#
+# For packed training set packed_sequence_size > 0.
+#
+# The mock dataset below emits *random* token ids. A loss around 7 is expected
+# and is not a precision bug; use a real text dataset for meaningful loss.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  # For multi-GPU: global_batch_size = nproc_per_node * local_batch_size
+  global_batch_size: 1
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  max_steps: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /path/to/converted-rwkv7-hf
+  torch_dtype: bf16
+  trust_remote_code: true
+  # RWKV7 has no SDPA/FlashAttention attention path; force the HF eager path.
+  attn_implementation: eager
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: /path/to/converted-rwkv7-hf
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false
+
+distributed:
+  # FSDP2 is the default Automodel training path.  DDP also works for 1 GPU.
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+compile:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 4
+  mean_len: 16
+  std_len: 0
+  vocab_size: 100
+  max_sentence_len: 32
+  seed: 0
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 1
+  mean_len: 16
+  std_len: 0
+  vocab_size: 100
+  max_sentence_len: 32
+  seed: 1
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0

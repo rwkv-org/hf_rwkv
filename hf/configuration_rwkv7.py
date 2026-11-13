@@ -12,7 +12,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 class RWKV7Config(PretrainedConfig):
 
-    model_type = 'rwkv7'
+    model_type = 'rwkv7_hf'
     keys_to_ignore_at_inference = ['past_key_values']
 
     def __init__(
