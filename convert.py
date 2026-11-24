@@ -55,6 +55,18 @@ CHAT_TEMPLATE_REQUIRED_TOKENS = ("✿",)
 # and therefore absent from the base vocabulary.
 VOCAB_SPECIAL_TOKENS = (EOS_TOKEN, *CHAT_TEMPLATE_REQUIRED_TOKENS)
 
+# ChatML control tokens and the ids they take in the unused tail of a 65,536-row
+# RWKV-7 vocabulary.  The converter adds any of these the vocabulary lacks, so a
+# template that needs them no longer requires a separate alignment step.
+CHATML_TOKEN_IDS = {
+    "<|im_start|>": 65530,
+    "<|im_end|>": 65531,
+    "<think>": 65532,
+    "</think>": 65533,
+}
+CHATML_ADDED_SPECIAL = ("<|im_start|>", "<|im_end|>")
+CHATML_END_OF_TURN = "<|im_end|>"
+
 DEFAULT_CHAT_TEMPLATE_PATH = DEFAULT_HF_SOURCE / "chat_template.jinja"
 DEFAULT_CHAT_TEMPLATE = DEFAULT_CHAT_TEMPLATE_PATH.read_text(encoding="utf-8")
 
@@ -452,9 +464,11 @@ def resolve_special_token_ids(vocab: VocabInfo) -> tuple[int, list[str]]:
 
 
 def validate_chat_template(
-    chat_template: str, vocab: VocabInfo, eos_id: int
+    chat_template: str, vocab: VocabInfo, eos_id: int, extra_tokens: set[str] | None = None
 ) -> None:
     available = set(vocab.token_ids)
+    if extra_tokens:
+        available |= set(extra_tokens)
     if eos_id == 0:
         available.add(EOS_TOKEN)
     # Catch every <|...|> control token, plus the RWKV separator/control
@@ -463,7 +477,13 @@ def validate_chat_template(
     for token in CHAT_TEMPLATE_REQUIRED_TOKENS:
         if token in chat_template:
             required.add(token)
-    missing = sorted(token for token in required if token not in available)
+    # vision tokens only appear in multimodal turns; a text-only vocabulary
+    # legitimately lacks them, so they are not a hard requirement
+    VISION_TOKENS = {"<|vision_start|>", "<|image_pad|>", "<|video_pad|>", "<|vision_end|>"}
+    missing = sorted(
+        token for token in required
+        if token not in available and token not in VISION_TOKENS
+    )
     if missing:
         raise ConversionError(
             "The chat template references tokens that are absent from "
@@ -478,11 +498,42 @@ def build_tokenizer_files(
     chat_template: str,
     *,
     model_max_length: int | None = None,
+    vocab_size: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, int], dict[str, int]]:
     eos_id, optional_special_tokens = resolve_special_token_ids(vocab)
 
+    # ChatML templates need <|im_start|> / <|im_end|> (and the think pair); the
+    # native vocabulary does not carry them, so park them on the unused tail.
+    chatml_tokens: dict[str, int] = {}
+    taken = set(vocab.token_ids.values())
+    for token, token_id in CHATML_TOKEN_IDS.items():
+        if token not in chat_template or token in vocab.token_ids:
+            continue
+        if vocab_size is not None and token_id >= vocab_size:
+            raise ConversionError(
+                f"The vocabulary has only {vocab_size} rows, so {token!r} "
+                f"cannot take id {token_id}."
+            )
+        if token_id in taken:
+            raise ConversionError(
+                f"id {token_id} is already used, cannot park {token!r} there."
+            )
+        chatml_tokens[token] = token_id
+        taken.add(token_id)
+    if CHATML_END_OF_TURN in chatml_tokens:
+        eos_id = chatml_tokens[CHATML_END_OF_TURN]
+
     added_tokens_decoder: dict[str, Any] = {}
-    if eos_id not in vocab.token_ids.values():
+    for token, token_id in sorted(chatml_tokens.items(), key=lambda kv: kv[1]):
+        added_tokens_decoder[str(token_id)] = {
+            "content": token,
+            "lstrip": False,
+            "normalized": False,
+            "rstrip": False,
+            "single_word": False,
+            "special": token in CHATML_ADDED_SPECIAL,
+        }
+    if eos_id not in vocab.token_ids.values() and str(eos_id) not in added_tokens_decoder:
         added_tokens_decoder[str(eos_id)] = {
             "content": EOS_TOKEN,
             "lstrip": False,
@@ -505,10 +556,11 @@ def build_tokenizer_files(
         },
         "add_bos_token": True,
         "bos_token": EOS_TOKEN,
-        "eos_token": EOS_TOKEN,
+        "eos_token": CHATML_END_OF_TURN if chatml_tokens else EOS_TOKEN,
         "unk_token": None,
-        "pad_token": None,
-        "additional_special_tokens": optional_special_tokens,
+        "pad_token": EOS_TOKEN,
+        "additional_special_tokens": list(optional_special_tokens)
+        + [t for t in CHATML_ADDED_SPECIAL if t in chatml_tokens],
         "model_max_length": model_max_length or 1_000_000_000_000,
         "chat_template": chat_template,
         "added_tokens_decoder": added_tokens_decoder,
@@ -516,17 +568,20 @@ def build_tokenizer_files(
 
     special_tokens_map = {
         "bos_token": EOS_TOKEN,
-        "eos_token": EOS_TOKEN,
-        "additional_special_tokens": optional_special_tokens,
+        "eos_token": CHATML_END_OF_TURN if chatml_tokens else EOS_TOKEN,
+        "pad_token": EOS_TOKEN,
+        "additional_special_tokens": list(optional_special_tokens)
+        + [t for t in CHATML_ADDED_SPECIAL if t in chatml_tokens],
     }
 
     explicit_ids = {
-        "bos_token_id": eos_id,
-        "eos_token_id": eos_id,
-        "pad_token_id": None,
+        "bos_token_id": 0,
+        "eos_token_id": eos_id if chatml_tokens else eos_id,
+        "pad_token_id": 0 if chatml_tokens else None,
     }
 
-    added_tokens = {EOS_TOKEN: eos_id} if eos_id not in vocab.token_ids.values() else {}
+    added_tokens = {EOS_TOKEN: 0}
+    added_tokens.update(chatml_tokens)
 
     return tokenizer_config, special_tokens_map, explicit_ids, added_tokens
 
@@ -909,6 +964,7 @@ def build_generation_config(
     special_token_ids: Mapping[str, int],
     max_position_embeddings: int,
     extra_eos_token_ids: Sequence[int] = (),
+    chatml: bool = False,
 ) -> dict[str, Any]:
     eos_token_ids = [special_token_ids["eos_token_id"]]
     for token_id in extra_eos_token_ids:
@@ -925,8 +981,10 @@ def build_generation_config(
         # arbitrary sampling policy into the model directory.
         "do_sample": False,
         "max_new_tokens": min(max_position_embeddings, 2048),
-        # Runtime stop markers for the official RWKV chat template.
-        "stop_strings": ["✿", "\nUser:", "\n### User"],
+        # Runtime stop markers for the embedded chat template.
+        "stop_strings": (
+            ["<|im_end|>"] if chatml else ["✿", "\nUser:", "\n### User"]
+        ),
     }
 
 
@@ -1091,16 +1149,32 @@ def warn_untrained_special_tokens(
     state_dict: Mapping[str, torch.Tensor],
     vocab: VocabInfo,
     eos_id: int,
+    added: Mapping[str, int] | None = None,
 ) -> None:
-    """Warn when a vocab declares special tokens the checkpoint never trained."""
+    """Report special tokens the checkpoint never trained.
+
+    Tokens this converter just parked on free ids are expected to be zero — the
+    checkpoint predates them — so they are reported as a note, not a warning.
+    """
     embedding = state_dict.get("emb.weight")
     if embedding is None:
         return
-    candidates = {EOS_TOKEN: eos_id, **vocab.token_ids}
+    added = dict(added or {})
+    # name the ids we introduced first, then fall back to the vocabulary names
+    candidates = {**vocab.token_ids, **added}
+    candidates[EOS_TOKEN] = 0
     for token, token_id in sorted(candidates.items(), key=lambda item: item[1]):
         if not (0 <= token_id < embedding.shape[0]):
             continue
-        if embedding[token_id].float().abs().max().item() < 1e-6:
+        if embedding[token_id].float().abs().max().item() >= 1e-6:
+            continue
+        if token in added:
+            print(
+                f"note: {token!r} takes the free id {token_id} and its embedding "
+                "is all-zero in the checkpoint; SFT has to learn it.",
+                file=sys.stderr,
+            )
+        else:
             print(
                 f"warning: token {token!r} (id {token_id}) has an all-zero "
                 "embedding in the checkpoint; the vocabulary may not match "
@@ -1144,13 +1218,18 @@ def prepare_artifacts(
         state_dict,
         vocab,
         explicit_ids["eos_token_id"],
+        added_tokens,
     )
     validate_chat_template(
         chat_template,
         vocab,
         explicit_ids["eos_token_id"],
+        extra_tokens=set(added_tokens),
     )
     extra_eos_token_ids: list[int] = []
+    if explicit_ids["pad_token_id"] == 0 and explicit_ids["eos_token_id"] != 0:
+        # ChatML: <|endoftext|> (id 0) also ends a document
+        extra_eos_token_ids.append(0)
     turn_end_id = vocab.token_ids.get("✿")
     if (
         turn_end_id is not None
@@ -1164,6 +1243,7 @@ def prepare_artifacts(
         explicit_ids,
         model_config["max_position_embeddings"],
         extra_eos_token_ids,
+        chatml="<|im_start|>" in chat_template,
     )
     converted = map_native_state_dict(state_dict)
     validate_converted_state_dict(converted, model_config)
@@ -1334,8 +1414,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional external Jinja chat template. The default is "
-            "hf/chat_template.jinja (official RWKV ✿ template); the template "
-            "is validated against the vocabulary."
+            "hf/chat_template.jinja (Qwen3.8 ChatML) "
+            "ChatML); the template is validated against the vocabulary."
         ),
     )
     parser.add_argument(
